@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "Not inside a git repository."
+  exit 1
+}
+
+EXCLUDE_FILE=".git/info/exclude"
+
+init_colors() {
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RESET="\033[0m"
+    C_BOLD="\033[1m"
+    C_DIM="\033[2m"
+    C_RED="\033[31m"
+    C_GREEN="\033[32m"
+    C_YELLOW="\033[33m"
+    C_BLUE="\033[34m"
+    C_MAGENTA="\033[35m"
+    C_CYAN="\033[36m"
+  else
+    C_RESET=""
+    C_BOLD=""
+    C_DIM=""
+    C_RED=""
+    C_GREEN=""
+    C_YELLOW=""
+    C_BLUE=""
+    C_MAGENTA=""
+    C_CYAN=""
+  fi
+}
+
+print_error() {
+  printf "%b\n" "${C_RED}$*${C_RESET}"
+}
+
+print_success() {
+  printf "%b\n" "${C_GREEN}$*${C_RESET}"
+}
+
+index_to_key() {
+  local n="$1"
+  if [ "$n" -le 9 ]; then
+    printf "%d" "$n"
+    return
+  fi
+
+  local x=$((n - 10))
+  local key=""
+  local rem
+  while true; do
+    rem=$((x % 26))
+    key="$(printf "\\$(printf '%03o' $((97 + rem)))")${key}"
+    x=$((x / 26 - 1))
+    if [ "$x" -lt 0 ]; then
+      break
+    fi
+  done
+  printf "%s" "$key"
+}
+
+choose_item_to_remove() {
+  local title="$1"
+  local empty_message="$2"
+  shift 2
+
+  local items=()
+  local p
+  for p in "$@"; do
+    if [ -n "$p" ]; then
+      items+=("$p")
+    fi
+  done
+
+  if [ "${#items[@]}" -eq 0 ]; then
+    printf "%b\n" "${C_YELLOW}${empty_message}${C_RESET}"
+    return 1
+  fi
+
+  echo
+  printf "%b\n" "${C_BOLD}${C_MAGENTA}== ${title} ==${C_RESET}"
+  local i key
+  for i in "${!items[@]}"; do
+    key="$(index_to_key $((i + 1)))"
+    printf "  %b%s)%b %s\n" "$C_CYAN" "$key" "$C_RESET" "${items[$i]}"
+  done
+
+  while true; do
+    printf "%b" "${C_BLUE}Remove which item? (key or q): ${C_RESET}" >&2
+    read -r selection
+    selection="$(printf "%s" "$selection" | tr '[:upper:]' '[:lower:]')"
+
+    if [ "$selection" = "q" ]; then
+      return 1
+    fi
+
+    for i in "${!items[@]}"; do
+      key="$(index_to_key $((i + 1)))"
+      if [ "$selection" = "$key" ]; then
+        SELECTED_ITEM="${items[$i]}"
+        return 0
+      fi
+    done
+
+    print_error "Invalid selection: $selection"
+  done
+}
+
+get_flagged() {
+  local flag="$1" # h or S
+  git ls-files -v | awk -v f="$flag" '$1==f {print $2}'
+}
+
+show_section() {
+  local title="$1"
+  local empty_message="$2"
+  shift
+  shift
+  echo
+  printf "%b\n" "${C_BOLD}${C_MAGENTA}== ${title} ==${C_RESET}"
+  local items=()
+  local p
+  for p in "$@"; do
+    if [ -n "$p" ]; then
+      items+=("$p")
+    fi
+  done
+  if [ "${#items[@]}" -eq 0 ]; then
+    printf "%b\n" "${C_YELLOW}${empty_message}${C_RESET}"
+    return
+  fi
+  local i=1
+  for p in "${items[@]}"; do
+    printf "%b\n" "${C_CYAN}$(printf "%2d" "$i"))${C_RESET} $p"
+    i=$((i+1))
+  done
+}
+
+read_exclude_lines() {
+  if [ -f "$EXCLUDE_FILE" ]; then
+    awk '
+      NR <= 200 &&
+      $0 !~ /^[[:space:]]*#/ &&
+      $0 !~ /^[[:space:]]*$/ { print }
+    ' "$EXCLUDE_FILE"
+  fi
+}
+
+is_tracked() {
+  git ls-files --error-unmatch -- "$1" >/dev/null 2>&1
+}
+
+add_assume_unchanged() {
+  local p="$1"
+  if ! is_tracked "$p"; then
+    print_error "Cannot set assume-unchanged: file is not tracked: $p"
+    return 1
+  fi
+  git update-index --assume-unchanged -- "$p"
+}
+
+add_skip_worktree() {
+  local p="$1"
+  if ! is_tracked "$p"; then
+    print_error "Cannot set skip-worktree: file is not tracked: $p"
+    return 1
+  fi
+  git update-index --skip-worktree -- "$p"
+}
+
+add_exclude() {
+  local p="$1"
+  mkdir -p "$(dirname "$EXCLUDE_FILE")"
+  touch "$EXCLUDE_FILE"
+
+  if grep -Fxq "$p" "$EXCLUDE_FILE"; then
+    printf "%b\n" "${C_YELLOW}Already in $EXCLUDE_FILE: $p${C_RESET}"
+    return 0
+  fi
+
+  echo "$p" >> "$EXCLUDE_FILE"
+}
+
+prompt_path() {
+  local p=""
+  while true; do
+    printf "%b" "${C_BLUE}Path (relative to repo root): ${C_RESET}" >&2
+    read -r p
+    p="${p#"./"}"
+    if [ -z "$p" ]; then
+      printf "%b\n" "${C_YELLOW}Please enter a path.${C_RESET}" >&2
+      continue
+    fi
+    echo "$p"
+    return 0
+  done
+}
+
+refresh_display() {
+  mapfile -t ASSUME < <(get_flagged "h" || true)
+  mapfile -t SKIP < <(get_flagged "S" || true)
+  mapfile -t EXCLUDE < <(read_exclude_lines || true)
+
+  show_section "assume-unchanged (h)" "[No files added]" "${ASSUME[@]:-}"
+  show_section "skip-worktree (S)" "[No files added]" "${SKIP[@]:-}"
+  show_section ".git/info/exclude" "[No paths added]" "${EXCLUDE[@]:-}"
+  echo
+}
+
+menu() {
+  printf "%b\n" "${C_BOLD}Choose an action:${C_RESET}"
+  printf "  %b1)%b Add path to assume-unchanged\n" "$C_CYAN" "$C_RESET"
+  printf "  %b2)%b Add path to skip-worktree\n" "$C_CYAN" "$C_RESET"
+  printf "  %b3)%b Add path to .git/info/exclude\n" "$C_CYAN" "$C_RESET"
+  printf "  %b4)%b Remove path from assume-unchanged\n" "$C_CYAN" "$C_RESET"
+  printf "  %b5)%b Remove path from skip-worktree\n" "$C_CYAN" "$C_RESET"
+  printf "  %b6)%b Remove exact line from .git/info/exclude\n" "$C_CYAN" "$C_RESET"
+  printf "  %br)%b Refresh / show current state\n" "$C_CYAN" "$C_RESET"
+  printf "  %bq)%b Quit\n" "$C_CYAN" "$C_RESET"
+}
+
+remove_assume_unchanged() {
+  local p="$1"
+  if ! is_tracked "$p"; then
+    print_error "File is not tracked: $p"
+    return 1
+  fi
+  git update-index --no-assume-unchanged -- "$p"
+}
+
+remove_skip_worktree() {
+  local p="$1"
+  if ! is_tracked "$p"; then
+    print_error "File is not tracked: $p"
+    return 1
+  fi
+  git update-index --no-skip-worktree -- "$p"
+}
+
+remove_exclude_line() {
+  local p="$1"
+  if [ ! -f "$EXCLUDE_FILE" ]; then
+    print_error "$EXCLUDE_FILE does not exist."
+    return 1
+  fi
+  if ! grep -Fxq "$p" "$EXCLUDE_FILE"; then
+    print_error "No exact matching line found in $EXCLUDE_FILE: $p"
+    return 1
+  fi
+  local tmp
+  tmp="$(mktemp)"
+  grep -Fxv "$p" "$EXCLUDE_FILE" > "$tmp"
+  mv "$tmp" "$EXCLUDE_FILE"
+}
+
+main() {
+  init_colors
+  refresh_display
+
+  while true; do
+    menu
+    printf "%b" "${C_BOLD}> ${C_RESET}"
+    read -r choice
+    case "$choice" in
+      1)
+        p="$(prompt_path)"
+        add_assume_unchanged "$p" && print_success "Set assume-unchanged: $p"
+        ;;
+      2)
+        p="$(prompt_path)"
+        add_skip_worktree "$p" && print_success "Set skip-worktree: $p"
+        ;;
+      3)
+        p="$(prompt_path)"
+        add_exclude "$p" && print_success "Added to $EXCLUDE_FILE: $p"
+        ;;
+      4)
+        mapfile -t ASSUME < <(get_flagged "h" || true)
+        if choose_item_to_remove "assume-unchanged (h)" "[No files added]" "${ASSUME[@]:-}"; then
+          remove_assume_unchanged "$SELECTED_ITEM" && print_success "Cleared assume-unchanged: $SELECTED_ITEM"
+        fi
+        ;;
+      5)
+        mapfile -t SKIP < <(get_flagged "S" || true)
+        if choose_item_to_remove "skip-worktree (S)" "[No files added]" "${SKIP[@]:-}"; then
+          remove_skip_worktree "$SELECTED_ITEM" && print_success "Cleared skip-worktree: $SELECTED_ITEM"
+        fi
+        ;;
+      6)
+        mapfile -t EXCLUDE < <(read_exclude_lines || true)
+        if choose_item_to_remove ".git/info/exclude" "[No paths added]" "${EXCLUDE[@]:-}"; then
+          remove_exclude_line "$SELECTED_ITEM" && print_success "Removed from $EXCLUDE_FILE: $SELECTED_ITEM"
+        fi
+        ;;
+      r|R)
+        ;;
+      q|Q)
+        printf "%b\n" "${C_DIM}Bye.${C_RESET}"
+        exit 0
+        ;;
+      *)
+        print_error "Unknown choice: $choice"
+        ;;
+    esac
+
+    refresh_display
+  done
+}
+
+main
