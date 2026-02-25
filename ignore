@@ -138,6 +138,52 @@ show_section() {
   done
 }
 
+has_head_changes() {
+  local p="$1"
+  if git diff --quiet HEAD -- "$p"; then
+    return 1
+  fi
+  return 0
+}
+
+show_skip_section() {
+  local title="$1"
+  local empty_message="$2"
+  shift
+  shift
+  echo
+  printf "%b\n" "${C_BOLD}${C_MAGENTA}== ${title} ==${C_RESET}"
+
+  local items=()
+  local p
+  for p in "$@"; do
+    if [ -n "$p" ]; then
+      items+=("$p")
+    fi
+  done
+
+  if [ "${#items[@]}" -eq 0 ]; then
+    printf "%b\n" "${C_YELLOW}${empty_message}${C_RESET}"
+    return
+  fi
+
+  local i=1
+  local marker any_marked=0
+  for p in "${items[@]}"; do
+    marker=" "
+    if has_head_changes "$p"; then
+      marker="${C_YELLOW}M${C_RESET}"
+      any_marked=1
+    fi
+    printf "%b %b\n" "${marker}" "${C_CYAN}$(printf "%2d" "$i"))${C_RESET} $p"
+    i=$((i+1))
+  done
+
+  if [ "$any_marked" -eq 1 ]; then
+    printf "%b\n" "${C_YELLOW}Any files marked with \"M\" have been updated on HEAD.${C_RESET}"
+  fi
+}
+
 read_exclude_lines() {
   if [ -f "$EXCLUDE_FILE" ]; then
     awk '
@@ -204,7 +250,7 @@ refresh_display() {
   mapfile -t EXCLUDE < <(read_exclude_lines || true)
 
   show_section "assume-unchanged (h)" "[No files added]" "${ASSUME[@]:-}"
-  show_section "skip-worktree (S)" "[No files added]" "${SKIP[@]:-}"
+  show_skip_section "skip-worktree (S)" "[No files added]" "${SKIP[@]:-}"
   show_section ".git/info/exclude" "[No paths added]" "${EXCLUDE[@]:-}"
   echo
 }
