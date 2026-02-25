@@ -7,6 +7,9 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null)" || {
 }
 
 EXCLUDE_FILE=".git/info/exclude"
+UPSTREAM_REF=""
+SKIP_REMOTE_CHANGED=()
+EXCLUDE_MISSING=()
 
 init_colors() {
   if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -38,6 +41,10 @@ print_error() {
 
 print_success() {
   printf "%b\n" "${C_GREEN}$*${C_RESET}"
+}
+
+print_info() {
+  printf "%b\n" "${C_BLUE}$*${C_RESET}"
 }
 
 index_to_key() {
@@ -138,12 +145,120 @@ show_section() {
   done
 }
 
-has_head_changes() {
-  local p="$1"
-  if git diff --quiet HEAD -- "$p"; then
+has_remote_changes() {
+  local upstream_ref="$1"
+  local p="$2"
+  if git diff --quiet "HEAD..$upstream_ref" -- "$p"; then
     return 1
   fi
   return 0
+}
+
+get_upstream_ref() {
+  git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true
+}
+
+path_in_list() {
+  local needle="$1"
+  shift
+  local p
+  for p in "$@"; do
+    if [ "$p" = "$needle" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+collect_remote_changed_skip_paths() {
+  local upstream_ref="$1"
+  shift
+  local p
+  for p in "$@"; do
+    if [ -n "$p" ] && has_remote_changes "$upstream_ref" "$p"; then
+      printf "%s\n" "$p"
+    fi
+  done
+}
+
+is_exclude_entry_present() {
+  local entry="$1"
+  local normalized="$entry"
+
+  # .git/info/exclude patterns are repo-root relative when prefixed with /
+  if [[ "$normalized" == /* ]]; then
+    normalized="${normalized#/}"
+  fi
+
+  # Fast path for plain paths without glob chars.
+  if [[ "$normalized" != *"*"* && "$normalized" != *"?"* && "$normalized" != *"["* ]]; then
+    [ -e "$normalized" ] && return 0
+    return 1
+  fi
+
+  # For glob patterns (including **), check if any current path matches.
+  local had_dotglob had_globstar had_nullglob
+  had_dotglob="$(shopt -p dotglob || true)"
+  had_globstar="$(shopt -p globstar || true)"
+  had_nullglob="$(shopt -p nullglob || true)"
+  shopt -s dotglob globstar nullglob
+
+  local matches=()
+  mapfile -t matches < <(compgen -G "$normalized" || true)
+
+  eval "$had_dotglob" || true
+  eval "$had_globstar" || true
+  eval "$had_nullglob" || true
+
+  [ "${#matches[@]}" -gt 0 ] && return 0
+  return 1
+}
+
+collect_missing_exclude_entries() {
+  local entry
+  for entry in "$@"; do
+    if [ -n "$entry" ] && ! is_exclude_entry_present "$entry"; then
+      printf "%s\n" "$entry"
+    fi
+  done
+}
+
+show_exclude_section() {
+  local title="$1"
+  local empty_message="$2"
+  shift
+  shift
+  echo
+  printf "%b\n" "${C_BOLD}${C_MAGENTA}== ${title} ==${C_RESET}"
+
+  local items=()
+  local p
+  for p in "$@"; do
+    if [ -n "$p" ]; then
+      items+=("$p")
+    fi
+  done
+
+  if [ "${#items[@]}" -eq 0 ]; then
+    printf "%b\n" "${C_YELLOW}${empty_message}${C_RESET}"
+    return
+  fi
+
+  local i=1
+  local marker any_deleted=0
+  for p in "${items[@]}"; do
+    marker=" "
+    if path_in_list "$p" "${EXCLUDE_MISSING[@]:-}"; then
+      marker="${C_RED}D${C_RESET}"
+      any_deleted=1
+    fi
+    printf "%b %b\n" "${marker}" "${C_CYAN}$(printf "%2d" "$i"))${C_RESET} $p"
+    i=$((i+1))
+  done
+
+  if [ "$any_deleted" -eq 1 ]; then
+    printf "%b\n" "${C_RED}Any entries marked with \"D\" no longer match existing files and can be removed from $EXCLUDE_FILE.${C_RESET}"
+  fi
 }
 
 show_skip_section() {
@@ -171,7 +286,7 @@ show_skip_section() {
   local marker any_marked=0
   for p in "${items[@]}"; do
     marker=" "
-    if has_head_changes "$p"; then
+    if path_in_list "$p" "${SKIP_REMOTE_CHANGED[@]:-}"; then
       marker="${C_YELLOW}M${C_RESET}"
       any_marked=1
     fi
@@ -180,7 +295,9 @@ show_skip_section() {
   done
 
   if [ "$any_marked" -eq 1 ]; then
-    printf "%b\n" "${C_YELLOW}Any files marked with \"M\" have been updated on HEAD.${C_RESET}"
+    printf "%b\n" "${C_YELLOW}Any files marked with \"M\" have been updated on remote (${UPSTREAM_REF}).${C_RESET}"
+  elif [ -z "$UPSTREAM_REF" ]; then
+    printf "%b\n" "${C_YELLOW}No upstream branch is configured; cannot check remote updates.${C_RESET}"
   fi
 }
 
@@ -248,10 +365,19 @@ refresh_display() {
   mapfile -t ASSUME < <(get_flagged "h" || true)
   mapfile -t SKIP < <(get_flagged "S" || true)
   mapfile -t EXCLUDE < <(read_exclude_lines || true)
+  UPSTREAM_REF="$(get_upstream_ref)"
+  SKIP_REMOTE_CHANGED=()
+  if [ -n "$UPSTREAM_REF" ] && [ "${#SKIP[@]}" -gt 0 ]; then
+    mapfile -t SKIP_REMOTE_CHANGED < <(collect_remote_changed_skip_paths "$UPSTREAM_REF" "${SKIP[@]}")
+  fi
+  EXCLUDE_MISSING=()
+  if [ "${#EXCLUDE[@]}" -gt 0 ]; then
+    mapfile -t EXCLUDE_MISSING < <(collect_missing_exclude_entries "${EXCLUDE[@]}")
+  fi
 
   show_section "assume-unchanged (h)" "[No files added]" "${ASSUME[@]:-}"
   show_skip_section "skip-worktree (S)" "[No files added]" "${SKIP[@]:-}"
-  show_section ".git/info/exclude" "[No paths added]" "${EXCLUDE[@]:-}"
+  show_exclude_section ".git/info/exclude" "[No paths added]" "${EXCLUDE[@]:-}"
   echo
 }
 
@@ -263,8 +389,40 @@ menu() {
   printf "  %b4)%b Remove path from assume-unchanged\n" "$C_CYAN" "$C_RESET"
   printf "  %b5)%b Remove path from skip-worktree\n" "$C_CYAN" "$C_RESET"
   printf "  %b6)%b Remove exact line from .git/info/exclude\n" "$C_CYAN" "$C_RESET"
+  if [ "${#EXCLUDE_MISSING[@]}" -gt 0 ]; then
+    printf "  %bd)%b %bRemove excluded entries that no longer exist%b\n" "$C_CYAN" "$C_RESET" "$C_RED" "$C_RESET"
+  fi
+  if [ "${#SKIP_REMOTE_CHANGED[@]}" -gt 0 ]; then
+    printf "  %bp)%b %bPull changes to skip-worktree files%b\n" "$C_CYAN" "$C_RESET" "$C_YELLOW" "$C_RESET"
+  fi
   printf "  %br)%b Refresh / show current state\n" "$C_CYAN" "$C_RESET"
   printf "  %bq)%b Quit\n" "$C_CYAN" "$C_RESET"
+}
+
+prompt_backup_choice() {
+  local choice
+  while true; do
+    printf "%b" "${C_BLUE}Back up local versions first (*.bak + add to $EXCLUDE_FILE)? (y/n/q): ${C_RESET}" >&2
+    read -r choice
+    choice="$(printf "%s" "$choice" | tr '[:upper:]' '[:lower:]')"
+    case "$choice" in
+      y|yes)
+        echo "yes"
+        return 0
+        ;;
+      n|no)
+        echo "no"
+        return 0
+        ;;
+      q|quit)
+        echo "cancel"
+        return 0
+        ;;
+      *)
+        print_error "Please choose y, n, or q."
+        ;;
+    esac
+  done
 }
 
 remove_assume_unchanged() {
@@ -299,6 +457,91 @@ remove_exclude_line() {
   tmp="$(mktemp)"
   grep -Fxv "$p" "$EXCLUDE_FILE" > "$tmp"
   mv "$tmp" "$EXCLUDE_FILE"
+}
+
+remove_missing_exclude_entries() {
+  if [ "${#EXCLUDE_MISSING[@]}" -eq 0 ]; then
+    printf "%b\n" "${C_YELLOW}No missing exclude entries to remove.${C_RESET}"
+    return 0
+  fi
+  if [ ! -f "$EXCLUDE_FILE" ]; then
+    print_error "$EXCLUDE_FILE does not exist."
+    return 1
+  fi
+
+  print_info "Removing ${#EXCLUDE_MISSING[@]} stale exclude entrie(s) from $EXCLUDE_FILE..."
+  local remove_tmp out_tmp
+  remove_tmp="$(mktemp)"
+  out_tmp="$(mktemp)"
+  printf "%s\n" "${EXCLUDE_MISSING[@]}" | awk 'NF && !seen[$0]++' > "$remove_tmp"
+  awk 'NR==FNR { remove[$0]=1; next } !($0 in remove)' "$remove_tmp" "$EXCLUDE_FILE" > "$out_tmp"
+  mv "$out_tmp" "$EXCLUDE_FILE"
+  rm -f "$remove_tmp"
+  print_success "Removed stale entries from $EXCLUDE_FILE."
+}
+
+pull_skip_worktree_remote_changes() {
+  if [ -z "$UPSTREAM_REF" ]; then
+    print_error "No upstream branch is configured; cannot update from remote."
+    return 1
+  fi
+
+  if [ "${#SKIP_REMOTE_CHANGED[@]}" -eq 0 ]; then
+    printf "%b\n" "${C_YELLOW}No skip-worktree files need updates from remote.${C_RESET}"
+    return 0
+  fi
+
+  local to_update=("${SKIP_REMOTE_CHANGED[@]}")
+  print_info "Preparing to update ${#to_update[@]} skip-worktree file(s) from ${UPSTREAM_REF}."
+  local backup_choice
+  backup_choice="$(prompt_backup_choice)"
+  if [ "$backup_choice" = "cancel" ]; then
+    printf "%b\n" "${C_YELLOW}Canceled update operation.${C_RESET}"
+    return 1
+  fi
+
+  local p backup_path
+  if [ "$backup_choice" = "yes" ]; then
+    print_info "Backing up local files and adding backups to $EXCLUDE_FILE..."
+    for p in "${to_update[@]}"; do
+      backup_path="${p}.bak"
+      mkdir -p "$(dirname "$backup_path")"
+      cp -p -- "$p" "$backup_path"
+      add_exclude "$backup_path"
+      print_success "Backed up: $p -> $backup_path"
+    done
+  else
+    print_info "Skipping backup step."
+  fi
+
+  print_info "Fetching latest refs from remote..."
+  if git fetch --quiet; then
+    print_success "Fetch complete."
+  else
+    print_error "git fetch failed. Resolve issues and run refresh."
+    return 1
+  fi
+
+  print_info "Overwriting files from ${UPSTREAM_REF} and clearing skip-worktree..."
+  local failed=0
+  for p in "${to_update[@]}"; do
+    remove_skip_worktree "$p"
+    if git restore --source "$UPSTREAM_REF" -- "$p"; then
+      print_success "Updated from remote and cleared skip-worktree: $p"
+    else
+      print_error "Failed to update from remote: $p"
+      failed=1
+    fi
+  done
+
+  if [ "$failed" -eq 1 ]; then
+    print_error "Some files failed to update. Run refresh and resolve as needed."
+    return 1
+  fi
+
+  print_success "Finished updating skip-worktree files from remote."
+
+  return 0
 }
 
 main() {
@@ -339,6 +582,12 @@ main() {
         if choose_item_to_remove ".git/info/exclude" "[No paths added]" "${EXCLUDE[@]:-}"; then
           remove_exclude_line "$SELECTED_ITEM" && print_success "Removed from $EXCLUDE_FILE: $SELECTED_ITEM"
         fi
+        ;;
+      d|D)
+        remove_missing_exclude_entries
+        ;;
+      p|P)
+        pull_skip_worktree_remote_changes
         ;;
       r|R)
         ;;

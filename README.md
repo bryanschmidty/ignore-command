@@ -2,6 +2,8 @@
 
 `ignore` is a small Bash command for managing patterns in a Git repository's local exclude file (`.git/info/exclude`) and for managing files marked with Git's `assume-unchanged` or `skip-worktree` flags.
 
+You can copy the script directly into a single project directory and run it there if you only want it for that repository. If you want to use `ignore` across all of your Git projects, it is recommended to move it into `~/.local/bin` so it is available globally in your shell.
+
 ## Install on macOS to `~/.local/bin`
 
 1. Create the local bin directory:
