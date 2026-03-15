@@ -551,7 +551,8 @@ main() {
   while true; do
     menu
     printf "%b" "${C_BOLD}> ${C_RESET}"
-    read -r choice
+    read -r -n 1 choice
+    echo
     case "$choice" in
       1)
         p="$(prompt_path)"
